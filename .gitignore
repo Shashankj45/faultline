@@ -1,0 +1,31 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+faultline
+
+# Local tools
+.tools/
+
+# Database files
+*.db
+*.db-journal
+test_verify.db
+faultline.db
+
+# Dependencies
+vendor/
+node_modules/
+
+# Web build
+web/dist/
+web/node_modules/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
