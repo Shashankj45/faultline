@@ -18,8 +18,11 @@ import (
 	"github.com/faultline-proxy/faultline/internal/faults"
 	"github.com/faultline-proxy/faultline/internal/metrics"
 	"github.com/faultline-proxy/faultline/internal/store"
+	"github.com/faultline-proxy/faultline/internal/telemetry"
 	"github.com/faultline-proxy/faultline/internal/validator"
 	"github.com/faultline-proxy/faultline/pkg/models"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ReverseProxyServer orchestrates dynamic routing, SSRF enforcement, and fault injection.
@@ -56,11 +59,17 @@ func (p *ReverseProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Start OpenTelemetry span with W3C TraceContext propagation
+	reqCtx, span := telemetry.StartProxySpan(r, upstream.Slug)
+	defer span.End()
+	r = r.WithContext(reqCtx)
+
 	clientIP := getClientIP(r)
 
 	// 2. Check Emergency Kill Switch (O(1) in-memory check)
 	killSwitch := p.store.CachedKillSwitch()
 	if killSwitch.GlobalActive {
+		span.SetAttributes(attribute.Bool("chaos.kill_switch_active", true))
 		// Passthrough immediately without chaos
 		p.forwardRequest(w, r, upstream, strippedPath, nil, start)
 		return
@@ -80,7 +89,8 @@ func (p *ReverseProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 4. Pre-Upstream Fault Interceptors
 	if matchedRule != nil {
-		injected := p.executePreUpstreamFault(w, r, upstream, matchedRule, start)
+		telemetry.RecordFaultInjection(span, string(matchedRule.FaultType), matchedRule.ExperimentID, matchedRule.Probability)
+		injected := p.executePreUpstreamFault(w, r, upstream, strippedPath, matchedRule, start)
 		if injected {
 			// Fault completely handled response (e.g. error, connection drop, stall)
 			return
@@ -91,7 +101,7 @@ func (p *ReverseProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.forwardRequest(w, r, upstream, strippedPath, matchedRule, start)
 }
 
-func (p *ReverseProxyServer) executePreUpstreamFault(w http.ResponseWriter, r *http.Request, upstream *models.Upstream, rule *models.FaultRule, start time.Time) bool {
+func (p *ReverseProxyServer) executePreUpstreamFault(w http.ResponseWriter, r *http.Request, upstream *models.Upstream, strippedPath string, rule *models.FaultRule, start time.Time) bool {
 	ctx := r.Context()
 
 	switch rule.FaultType {
@@ -99,7 +109,14 @@ func (p *ReverseProxyServer) executePreUpstreamFault(w http.ResponseWriter, r *h
 		var cfg models.LatencyConfig
 		if err := json.Unmarshal(rule.Config, &cfg); err == nil {
 			p.metrics.RecordInjectedFault(upstream.Slug, rule.ExperimentID, string(models.FaultLatency))
-			_ = p.engine.ApplyLatency(ctx, &cfg, nil)
+			// Fetch experiment's started_at for accurate ramp latency calculation
+			var expStartedAt *time.Time
+			if cfg.Distribution == models.DistRamp {
+				if exp, err := p.store.GetExperimentByID(ctx, rule.ExperimentID); err == nil {
+					expStartedAt = exp.StartedAt
+				}
+			}
+			_ = p.engine.ApplyLatency(ctx, &cfg, expStartedAt)
 		}
 		return false // Continue to upstream after latency
 
@@ -142,6 +159,19 @@ func (p *ReverseProxyServer) executePreUpstreamFault(w http.ResponseWriter, r *h
 				p.metrics.RecordInjectedFault(upstream.Slug, rule.ExperimentID, string(models.FaultBandwidthLimit))
 				r.Body = io.NopCloser(faults.WrapThrottledReader(r.Body, cfg.RateBytesPerSec))
 			}
+		}
+		return false
+
+	case models.FaultPacketLoss:
+		var cfg models.PacketLossConfig
+		if err := json.Unmarshal(rule.Config, &cfg); err == nil {
+			p.metrics.RecordInjectedFault(upstream.Slug, rule.ExperimentID, string(models.FaultPacketLoss))
+			// Wrap the ResponseWriter so the downstream response stream gets dropped/corrupted chunks
+			pw := &packetLossResponseWriter{ResponseWriter: w, cfg: &cfg}
+			w.Header().Set("X-FaultLine-Injected", "true")
+			w.Header().Set("X-FaultLine-Fault", "packet_loss")
+			p.forwardRequest(pw, r, upstream, strippedPath, rule, start)
+			return true
 		}
 		return false
 
@@ -196,6 +226,14 @@ func (p *ReverseProxyServer) forwardRequest(w http.ResponseWriter, r *http.Reque
 		faultName = string(matchedRule.FaultType)
 	}
 
+	if span := trace.SpanFromContext(r.Context()); span != nil && span.IsRecording() {
+		span.SetAttributes(
+			attribute.Int("http.response.status_code", rec.statusCode),
+			attribute.Int64("http.response.duration_ms", duration.Milliseconds()),
+			attribute.String("chaos.applied_fault", faultName),
+		)
+	}
+
 	p.metrics.RecordRequest(upstream.Slug, r.Method, strconv.Itoa(rec.statusCode), duration, faultName)
 }
 
@@ -236,6 +274,13 @@ func (p *ReverseProxyServer) getOrCreateReverseProxy(upstream *models.Upstream) 
 	revProxy.ModifyResponse = func(resp *http.Response) error {
 		resp.Header.Set("X-FaultLine-Proxy", "1.0")
 		resp.Header.Set("X-FaultLine-Upstream", upstream.Slug)
+
+		// Rewrite relative Location headers on upstream redirects so clients remain within the proxy route
+		if loc := resp.Header.Get("Location"); loc != "" {
+			if strings.HasPrefix(loc, "/") && !strings.HasPrefix(loc, "/proxy/") {
+				resp.Header.Set("Location", fmt.Sprintf("/proxy/%s%s", upstream.Slug, loc))
+			}
+		}
 		return nil
 	}
 	revProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
@@ -283,6 +328,39 @@ func getClientIP(r *http.Request) string {
 		return ip
 	}
 	return r.RemoteAddr
+}
+
+// packetLossResponseWriter wraps a ResponseWriter and applies packet loss to the response body.
+type packetLossResponseWriter struct {
+	http.ResponseWriter
+	cfg        *models.PacketLossConfig
+	plWriter   io.Writer
+	wroteHdr   bool
+	statusCode int
+}
+
+func (pl *packetLossResponseWriter) WriteHeader(code int) {
+	if !pl.wroteHdr {
+		pl.statusCode = code
+		pl.wroteHdr = true
+		pl.ResponseWriter.WriteHeader(code)
+	}
+}
+
+func (pl *packetLossResponseWriter) Write(b []byte) (int, error) {
+	if !pl.wroteHdr {
+		pl.WriteHeader(http.StatusOK)
+	}
+	if pl.plWriter == nil {
+		pl.plWriter = faults.WrapPacketLossWriter(pl.ResponseWriter, pl.cfg)
+	}
+	return pl.plWriter.Write(b)
+}
+
+func (pl *packetLossResponseWriter) Flush() {
+	if f, ok := pl.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 type statusRecorder struct {

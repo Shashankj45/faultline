@@ -32,6 +32,9 @@ type Router struct {
 	auditLogger *audit.Logger
 	authService *auth.AuthService
 	validator   *validator.DestinationValidator
+	// devMode disables API key enforcement when no keys exist yet (bootstrap mode).
+	// Once any key is created, enforcement is active on all subsequent requests.
+	devMode bool
 }
 
 // NewRouter constructs the API router and registers endpoints.
@@ -71,49 +74,78 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.mux.ServeHTTP(w, req)
 }
 
+// requireRole wraps a handler with RBAC enforcement.
+//
+// Bootstrap mode: if no API keys exist in the store, the system is in dev/bootstrap mode
+// and all requests are allowed (the console needs to be accessible to create the first key).
+// Once at least one active key exists, every request to protected routes must carry a valid
+// Bearer token or X-API-Key header with sufficient role.
+func (r *Router) requireRole(required models.Role, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		// Check bootstrap mode — if no keys exist, skip auth so user can create first key
+		if keys, err := r.store.ListAPIKeys(req.Context()); err == nil && len(keys) == 0 {
+			next(w, req)
+			return
+		}
+
+		apiKey, err := r.authService.Authenticate(req)
+		if err != nil {
+			jsonError(w, http.StatusUnauthorized, "unauthorized: missing or invalid API key (use X-API-Key header or Bearer token)")
+			return
+		}
+
+		if !auth.EnforceRole(apiKey.Role, required) {
+			jsonError(w, http.StatusForbidden, fmt.Sprintf("forbidden: role %q is required, your key has role %q", required, apiKey.Role))
+			return
+		}
+
+		next(w, req)
+	}
+}
+
 func (r *Router) registerRoutes() {
-	// Prometheus metrics endpoint
+	// Prometheus metrics endpoint (public)
 	r.mux.Handle("/metrics", r.metrics.Handler())
 
-	// API Health & Live Telemetry
+	// API Health & Live Telemetry (public read)
 	r.mux.HandleFunc("GET /api/v1/health", r.handleHealth)
 	r.mux.HandleFunc("GET /api/v1/metrics/live", r.handleLiveMetrics)
 
-	// Kill Switch
+	// Kill Switch (viewer can read; operator+ can write)
 	r.mux.HandleFunc("GET /api/v1/killswitch", r.handleGetKillSwitch)
-	r.mux.HandleFunc("POST /api/v1/killswitch", r.handleSetKillSwitch)
+	r.mux.HandleFunc("POST /api/v1/killswitch", r.requireRole(models.RoleOperator, r.handleSetKillSwitch))
 
-	// Upstreams
+	// Upstreams (viewer can list/get; admin can mutate)
 	r.mux.HandleFunc("GET /api/v1/upstreams", r.handleListUpstreams)
-	r.mux.HandleFunc("POST /api/v1/upstreams", r.handleCreateUpstream)
+	r.mux.HandleFunc("POST /api/v1/upstreams", r.requireRole(models.RoleAdmin, r.handleCreateUpstream))
 	r.mux.HandleFunc("GET /api/v1/upstreams/{id}", r.handleGetUpstream)
-	r.mux.HandleFunc("PUT /api/v1/upstreams/{id}", r.handleUpdateUpstream)
-	r.mux.HandleFunc("DELETE /api/v1/upstreams/{id}", r.handleDeleteUpstream)
+	r.mux.HandleFunc("PUT /api/v1/upstreams/{id}", r.requireRole(models.RoleAdmin, r.handleUpdateUpstream))
+	r.mux.HandleFunc("DELETE /api/v1/upstreams/{id}", r.requireRole(models.RoleAdmin, r.handleDeleteUpstream))
 
-	// Experiments
+	// Experiments (viewer can list/get; operator+ can mutate)
 	r.mux.HandleFunc("GET /api/v1/experiments", r.handleListExperiments)
-	r.mux.HandleFunc("POST /api/v1/experiments", r.handleCreateExperiment)
+	r.mux.HandleFunc("POST /api/v1/experiments", r.requireRole(models.RoleOperator, r.handleCreateExperiment))
 	r.mux.HandleFunc("GET /api/v1/experiments/{id}", r.handleGetExperiment)
-	r.mux.HandleFunc("PUT /api/v1/experiments/{id}", r.handleUpdateExperiment)
-	r.mux.HandleFunc("POST /api/v1/experiments/{id}/status", r.handleUpdateExperimentStatus)
-	r.mux.HandleFunc("DELETE /api/v1/experiments/{id}", r.handleDeleteExperiment)
+	r.mux.HandleFunc("PUT /api/v1/experiments/{id}", r.requireRole(models.RoleOperator, r.handleUpdateExperiment))
+	r.mux.HandleFunc("POST /api/v1/experiments/{id}/status", r.requireRole(models.RoleOperator, r.handleUpdateExperimentStatus))
+	r.mux.HandleFunc("DELETE /api/v1/experiments/{id}", r.requireRole(models.RoleAdmin, r.handleDeleteExperiment))
 
-	// Fault Rules
+	// Fault Rules (operator+ can mutate)
 	r.mux.HandleFunc("GET /api/v1/experiments/{id}/rules", r.handleListRules)
-	r.mux.HandleFunc("POST /api/v1/experiments/{id}/rules", r.handleCreateRule)
-	r.mux.HandleFunc("PUT /api/v1/rules/{id}", r.handleUpdateRule)
-	r.mux.HandleFunc("DELETE /api/v1/rules/{id}", r.handleDeleteRule)
+	r.mux.HandleFunc("POST /api/v1/experiments/{id}/rules", r.requireRole(models.RoleOperator, r.handleCreateRule))
+	r.mux.HandleFunc("PUT /api/v1/rules/{id}", r.requireRole(models.RoleOperator, r.handleUpdateRule))
+	r.mux.HandleFunc("DELETE /api/v1/rules/{id}", r.requireRole(models.RoleAdmin, r.handleDeleteRule))
 
-	// Audit Logs
+	// Audit Logs (viewer+)
 	r.mux.HandleFunc("GET /api/v1/audit-logs", r.handleListAuditLogs)
 
-	// API Keys
-	r.mux.HandleFunc("GET /api/v1/api-keys", r.handleListAPIKeys)
-	r.mux.HandleFunc("POST /api/v1/api-keys", r.handleCreateAPIKey)
-	r.mux.HandleFunc("DELETE /api/v1/api-keys/{id}", r.handleRevokeAPIKey)
+	// API Keys (admin only)
+	r.mux.HandleFunc("GET /api/v1/api-keys", r.requireRole(models.RoleAdmin, r.handleListAPIKeys))
+	r.mux.HandleFunc("POST /api/v1/api-keys", r.requireRole(models.RoleAdmin, r.handleCreateAPIKey))
+	r.mux.HandleFunc("DELETE /api/v1/api-keys/{id}", r.requireRole(models.RoleAdmin, r.handleRevokeAPIKey))
 
-	// Interactive Test Studio
-	r.mux.HandleFunc("POST /api/v1/test-studio/dispatch", r.handleTestStudioDispatch)
+	// Interactive Test Studio (operator+)
+	r.mux.HandleFunc("POST /api/v1/test-studio/dispatch", r.requireRole(models.RoleOperator, r.handleTestStudioDispatch))
 }
 
 // --- Handler Implementations ---

@@ -46,7 +46,7 @@ func Start() *MockCluster {
 			"created_at": time.Now().UTC().Format(time.RFC3339),
 		})
 	})
-	orderMux.HandleFunc("GET /v1/orders/", func(w http.ResponseWriter, r *http.Request) {
+	orderHandler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -55,7 +55,9 @@ func Start() *MockCluster {
 			"status":   "shipped",
 			"carrier":  "FedEx Priority",
 		})
-	})
+	}
+	orderMux.HandleFunc("GET /v1/orders", orderHandler)
+	orderMux.HandleFunc("GET /v1/orders/", orderHandler)
 	cluster.OrderServer = httptest.NewServer(orderMux)
 
 	// 2. Payment Gateway Mock
@@ -85,7 +87,7 @@ func Start() *MockCluster {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ONLINE","service":"inventory-service"}`))
 	})
-	invMux.HandleFunc("GET /v1/stock/", func(w http.ResponseWriter, r *http.Request) {
+	stockHandler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -94,7 +96,9 @@ func Start() *MockCluster {
 			"warehouse":  "US-EAST-1",
 			"backorder":  false,
 		})
-	})
+	}
+	invMux.HandleFunc("GET /v1/stock", stockHandler)
+	invMux.HandleFunc("GET /v1/stock/", stockHandler)
 	cluster.InventoryServer = httptest.NewServer(invMux)
 
 	return cluster

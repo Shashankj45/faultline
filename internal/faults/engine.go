@@ -319,6 +319,60 @@ func (tw *throttledWriter) Write(p []byte) (int, error) {
 	return tw.w.Write(p)
 }
 
+// --- Packet Loss Simulation ---
+
+// packetLossWriter wraps an io.Writer and stochastically drops or corrupts chunks.
+// Since we operate at the HTTP layer (not actual IP), we simulate packet loss by:
+//  1. Dropping chunks entirely (not writing them) — produces garbled/truncated body.
+//  2. Corrupting random bytes within a chunk — simulates bitflip/checksum failure.
+//
+// This is applied to the downstream response writer so the client sees a corrupted stream.
+type packetLossWriter struct {
+	w            io.Writer
+	dropPercent  float64 // 0.0–1.0
+	corruptBytes bool
+}
+
+func (pl *packetLossWriter) Write(p []byte) (int, error) {
+	if pl.dropPercent > 0 && CryptoFloat64() < pl.dropPercent {
+		// Silently swallow this chunk — simulates dropped IP packet segment
+		return len(p), nil
+	}
+	if pl.corruptBytes && len(p) > 0 {
+		// Clone to avoid mutating caller's buffer
+		mutated := make([]byte, len(p))
+		copy(mutated, p)
+		// Corrupt a random byte
+		idx := int(CryptoFloat64() * float64(len(mutated)))
+		if idx >= len(mutated) {
+			idx = len(mutated) - 1
+		}
+		mutated[idx] ^= 0xFF // Flip all bits in one byte
+		return pl.w.Write(mutated)
+	}
+	return pl.w.Write(p)
+}
+
+// WrapPacketLossWriter wraps a downstream ResponseWriter body with packet loss simulation.
+// Returns the writer unmodified if no loss is configured.
+func WrapPacketLossWriter(w io.Writer, cfg *models.PacketLossConfig) io.Writer {
+	if cfg == nil {
+		return w
+	}
+	if cfg.DropChunkPercent <= 0 && !cfg.CorruptBytes {
+		return w
+	}
+	drop := cfg.DropChunkPercent
+	if drop > 1.0 {
+		drop = 1.0
+	}
+	return &packetLossWriter{
+		w:            w,
+		dropPercent:  drop,
+		corruptBytes: cfg.CorruptBytes,
+	}
+}
+
 // IsBurstActive evaluates if the current time falls inside an active burst failure window.
 func IsBurstActive(cfg *models.BurstConfig) bool {
 	if cfg.BurstIntervalMs <= 0 || cfg.BurstDurationMs <= 0 {
