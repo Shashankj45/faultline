@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -88,6 +89,11 @@ func (a *AuthService) Authenticate(r *http.Request) (*models.APIKey, error) {
 	keyHash := HashKey(rawKey)
 	apiKey, err := a.store.GetAPIKeyByHash(r.Context(), keyHash)
 	if err != nil || !apiKey.IsActive {
+		return nil, ErrUnauthorized
+	}
+
+	// Constant-time hash verification to eliminate timing attack vectors
+	if subtle.ConstantTimeCompare([]byte(apiKey.KeyHash), []byte(keyHash)) != 1 {
 		return nil, ErrUnauthorized
 	}
 

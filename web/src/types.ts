@@ -93,6 +93,17 @@ export interface AuditLog {
   timestamp: string;
 }
 
+export interface APIKey {
+  id: string;
+  name: string;
+  key_prefix: string;
+  role: Role;
+  expires_at?: string;
+  last_used_at?: string;
+  is_active: boolean;
+  created_at: string;
+}
+
 export interface LiveStats {
   requests_per_sec: number;
   error_rate_percent: number;

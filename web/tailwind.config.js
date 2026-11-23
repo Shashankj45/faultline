@@ -7,24 +7,23 @@ export default {
   theme: {
     extend: {
       colors: {
-        // FaultLine design system tokens mapped as Tailwind colors
-        'fl-bg':        '#070a12',
-        'fl-surface':   '#0d121f',
-        'fl-card':      '#121829',
+        'fl-bg':        '#0b0f17',
+        'fl-surface':   '#0e1422',
+        'fl-card':      '#131a2c',
         'fl-border':    '#1e293b',
-        'fl-rose':      '#f43f5e',
-        'fl-blue':      '#3b82f6',
-        'fl-emerald':   '#10b981',
-        'fl-amber':     '#f59e0b',
+        'fl-rose':      '#e11d48',
+        'fl-sky':       '#0284c7',
+        'fl-emerald':   '#059669',
+        'fl-amber':     '#d97706',
       },
       fontFamily: {
-        sans: ['Plus Jakarta Sans', 'system-ui', 'sans-serif'],
-        mono: ['JetBrains Mono', 'monospace'],
+        sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'Roboto', 'sans-serif'],
+        mono: ['JetBrains Mono', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace'],
       },
-      boxShadow: {
-        'card': '0 4px 20px -2px rgba(0, 0, 0, 0.4)',
-        'glow-rose': '0 0 20px rgba(244, 63, 94, 0.3)',
-        'glow-blue': '0 0 20px rgba(59, 130, 246, 0.3)',
+      borderRadius: {
+        DEFAULT: '4px',
+        md: '6px',
+        lg: '8px',
       },
     },
   },
