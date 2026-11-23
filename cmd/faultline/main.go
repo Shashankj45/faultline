@@ -53,6 +53,29 @@ func main() {
 		seedDefaultUpstreams(sqlStore, mockCluster)
 	}
 
+	// 2.5 Seed Initial Admin Key if configured via environment or flag and no keys exist
+	if cfg.AdminToken != "" && !sqlStore.HasAPIKeys() {
+		keyHash := auth.HashKey(cfg.AdminToken)
+		keyPrefix := cfg.AdminToken
+		if len(keyPrefix) > 11 {
+			keyPrefix = keyPrefix[:11]
+		}
+		adminKey := &models.APIKey{
+			ID:        "key_env_bootstrap",
+			Name:      "Environment Admin Key",
+			KeyHash:   keyHash,
+			KeyPrefix: keyPrefix,
+			Role:      models.RoleAdmin,
+			IsActive:  true,
+			CreatedAt: time.Now().UTC(),
+		}
+		if err := sqlStore.CreateAPIKey(context.Background(), adminKey); err == nil {
+			log.Println("[INFO] Administrative API key seeded from environment configuration (Role: admin)")
+		} else {
+			log.Printf("[WARN] Failed to seed administrative key from environment: %v", err)
+		}
+	}
+
 	// 3. Core Engine & Observability Components
 	_, otelShutdown := telemetry.InitTracer("faultline-proxy")
 	defer func() {
@@ -249,10 +272,17 @@ func seedDefaultUpstreams(s *store.SQLStore, cluster *mockservices.MockCluster) 
 }
 
 func createWebHandler(staticDir string) http.HandlerFunc {
+	applySecurityHeaders := func(w http.ResponseWriter) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	}
+
 	// Check if built web directory exists
 	if _, err := os.Stat(filepath.Join(staticDir, "index.html")); err == nil {
 		fs := http.FileServer(http.Dir(staticDir))
 		return func(w http.ResponseWriter, r *http.Request) {
+			applySecurityHeaders(w)
 			path := filepath.Join(staticDir, filepath.Clean(r.URL.Path))
 			if _, err := os.Stat(path); os.IsNotExist(err) {
 				// Fallback to index.html for React SPA client routing
@@ -265,6 +295,7 @@ func createWebHandler(staticDir string) http.HandlerFunc {
 
 	// Dynamic fallback landing page if static files aren't built yet
 	return func(w http.ResponseWriter, r *http.Request) {
+		applySecurityHeaders(w)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`<!DOCTYPE html>

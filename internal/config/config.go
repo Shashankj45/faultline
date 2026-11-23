@@ -20,7 +20,7 @@ func Load() *Config {
 		Port:         8080,
 		DatabaseURL:  "faultline.db",
 		Driver:       "sqlite",
-		AdminToken:   "fl_live_supersecret_admin_token",
+		AdminToken:   "",
 		MockServices: true,
 		StaticDir:    "web/dist",
 	}

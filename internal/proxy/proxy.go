@@ -301,6 +301,13 @@ func (p *ReverseProxyServer) getOrCreateReverseProxy(upstream *models.Upstream) 
 	}
 
 	revProxy := httputil.NewSingleHostReverseProxy(targetURL)
+	origDirector := revProxy.Director
+	revProxy.Director = func(req *http.Request) {
+		origDirector(req)
+		// Ensure the upstream receives its own hostname in the Host header for virtual hosting and SNI,
+		// while preserving the original client Host in X-Forwarded-Host.
+		req.Host = targetURL.Host
+	}
 	revProxy.Transport = transport
 	revProxy.BufferPool = p.bufferPool
 	revProxy.ModifyResponse = func(resp *http.Response) error {

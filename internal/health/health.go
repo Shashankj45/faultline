@@ -85,6 +85,11 @@ func (mon *Monitor) probeUpstream(u models.Upstream) {
 	probeClient := &http.Client{
 		Transport: probeTransport,
 		Timeout:   5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Do not follow redirects: health probes must inspect the explicit configured endpoint
+			// and avoid following open redirects or SSRF bouncing.
+			return http.ErrUseLastResponse
+		},
 	}
 
 	start := time.Now()

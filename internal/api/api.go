@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -61,7 +62,17 @@ func NewRouter(
 	return r
 }
 
+// SetDevMode toggles development/testing mode bypass for initial bootstrap in unit test fixtures.
+func (r *Router) SetDevMode(enabled bool) {
+	r.devMode = enabled
+}
+
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Standard security headers
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
 	// Enable CORS for frontend dashboard
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
@@ -88,17 +99,35 @@ func (r *Router) getActor(req *http.Request) string {
 
 // requireRole wraps a handler with RBAC enforcement.
 //
-// Bootstrap mode: if no API keys exist in the store, the system is in dev/bootstrap mode
-// and all requests are allowed (the console needs to be accessible to create the first key).
+// Bootstrap mode: if no active API keys exist in the store, the system permits initial
+// admin creation at POST /api/v1/api-keys (or loopback local dev access).
 // Once at least one active key exists, every request to protected routes must carry a valid
 // Bearer token or X-API-Key header with sufficient role.
 func (r *Router) requireRole(required models.Role, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		// Check bootstrap mode via O(1) in-memory atomic flag.
-		// If no active API keys exist, allow initial access so operator can bootstrap the first key.
 		if !r.store.HasAPIKeys() {
-			req = req.WithContext(context.WithValue(req.Context(), actorContextKey, "bootstrap"))
-			next(w, req)
+			// 1. Initial key creation is always permitted so operator can initialize the first key.
+			if req.Method == http.MethodPost && (req.URL.Path == "/api/v1/api-keys" || strings.TrimSuffix(req.URL.Path, "/") == "/api/v1/api-keys") {
+				req = req.WithContext(context.WithValue(req.Context(), actorContextKey, "bootstrap"))
+				next(w, req)
+				return
+			}
+
+			// 2. Dev mode / Loopback local connections (tests, CLI, local dev) are permitted.
+			host, _, err := net.SplitHostPort(req.RemoteAddr)
+			if err != nil {
+				host = req.RemoteAddr
+			}
+			ip := net.ParseIP(host)
+			if r.devMode || (ip != nil && ip.IsLoopback()) || host == "localhost" || host == "" {
+				req = req.WithContext(context.WithValue(req.Context(), actorContextKey, "bootstrap_local"))
+				next(w, req)
+				return
+			}
+
+			// 3. Remote requests on an unkeyed instance cannot perform destructive operations without authenticating.
+			jsonError(w, http.StatusUnauthorized, "unauthorized: initial admin API key required. Provision via FAULTLINE_ADMIN_TOKEN or create via POST /api/v1/api-keys")
 			return
 		}
 
