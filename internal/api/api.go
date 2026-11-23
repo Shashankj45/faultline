@@ -2,15 +2,16 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/faultline-proxy/faultline/internal/audit"
@@ -34,9 +35,11 @@ type Router struct {
 	auditLogger *audit.Logger
 	authService *auth.AuthService
 	validator   *validator.DestinationValidator
-	// devMode disables API key enforcement when no keys exist yet (bootstrap mode).
+	// devMode disables API key enforcement when no keys exist yet (bootstrap mode in unit tests).
 	// Once any key is created, enforcement is active on all subsequent requests.
-	devMode bool
+	devMode        bool
+	bootstrapToken string
+	bootstrapMu    sync.Mutex
 }
 
 // NewRouter constructs the API router and registers endpoints.
@@ -65,6 +68,13 @@ func NewRouter(
 // SetDevMode toggles development/testing mode bypass for initial bootstrap in unit test fixtures.
 func (r *Router) SetDevMode(enabled bool) {
 	r.devMode = enabled
+}
+
+// SetBootstrapToken sets the one-time ephemeral bootstrap token required to register the initial admin key.
+func (r *Router) SetBootstrapToken(token string) {
+	r.bootstrapMu.Lock()
+	defer r.bootstrapMu.Unlock()
+	r.bootstrapToken = token
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -107,27 +117,46 @@ func (r *Router) requireRole(required models.Role, next http.HandlerFunc) http.H
 	return func(w http.ResponseWriter, req *http.Request) {
 		// Check bootstrap mode via O(1) in-memory atomic flag.
 		if !r.store.HasAPIKeys() {
-			// 1. Initial key creation is always permitted so operator can initialize the first key.
+			// In bootstrap mode (no API keys registered yet):
+			// 1. Initial key creation via POST /api/v1/api-keys
 			if req.Method == http.MethodPost && (req.URL.Path == "/api/v1/api-keys" || strings.TrimSuffix(req.URL.Path, "/") == "/api/v1/api-keys") {
+				if r.devMode {
+					req = req.WithContext(context.WithValue(req.Context(), actorContextKey, "bootstrap"))
+					next(w, req)
+					return
+				}
+
+				r.bootstrapMu.Lock()
+				expectedToken := r.bootstrapToken
+				r.bootstrapMu.Unlock()
+
+				tokenSupplied := req.Header.Get("X-Bootstrap-Token")
+				if tokenSupplied == "" {
+					authHeader := req.Header.Get("Authorization")
+					if strings.HasPrefix(authHeader, "Bearer ") {
+						tokenSupplied = strings.TrimPrefix(authHeader, "Bearer ")
+					}
+				}
+
+				if expectedToken != "" && subtle.ConstantTimeCompare([]byte(tokenSupplied), []byte(expectedToken)) != 1 {
+					jsonError(w, http.StatusUnauthorized, "unauthorized: valid X-Bootstrap-Token header required for initial admin registration. Check server startup logs or set FAULTLINE_ADMIN_TOKEN.")
+					return
+				}
+
 				req = req.WithContext(context.WithValue(req.Context(), actorContextKey, "bootstrap"))
 				next(w, req)
 				return
 			}
 
-			// 2. Dev mode / Loopback local connections (tests, CLI, local dev) are permitted.
-			host, _, err := net.SplitHostPort(req.RemoteAddr)
-			if err != nil {
-				host = req.RemoteAddr
-			}
-			ip := net.ParseIP(host)
-			if r.devMode || (ip != nil && ip.IsLoopback()) || host == "localhost" || host == "" {
+			// 2. Dev mode bypass in unit test fixtures
+			if r.devMode {
 				req = req.WithContext(context.WithValue(req.Context(), actorContextKey, "bootstrap_local"))
 				next(w, req)
 				return
 			}
 
-			// 3. Remote requests on an unkeyed instance cannot perform destructive operations without authenticating.
-			jsonError(w, http.StatusUnauthorized, "unauthorized: initial admin API key required. Provision via FAULTLINE_ADMIN_TOKEN or create via POST /api/v1/api-keys")
+			// 3. All other operations (kill switch, upstreams mutation, experiments) are strictly blocked during bootstrap
+			jsonError(w, http.StatusUnauthorized, "unauthorized: initial admin API key required. Provision via FAULTLINE_ADMIN_TOKEN or initialize via POST /api/v1/api-keys with X-Bootstrap-Token.")
 			return
 		}
 
@@ -589,6 +618,16 @@ func (r *Router) handleListAPIKeys(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Router) handleCreateAPIKey(w http.ResponseWriter, req *http.Request) {
+	// Guard against concurrent initial bootstrap creation races
+	r.bootstrapMu.Lock()
+	defer r.bootstrapMu.Unlock()
+
+	// If this request came through bootstrap mode, verify under lock that another request didn't already bootstrap
+	if r.getActor(req) == "bootstrap" && r.store.HasAPIKeys() {
+		jsonError(w, http.StatusConflict, "conflict: initial admin key has already been created. Subsequent key creation requires admin authentication.")
+		return
+	}
+
 	var body struct {
 		Name string      `json:"name"`
 		Role models.Role `json:"role"`
@@ -614,6 +653,9 @@ func (r *Router) handleCreateAPIKey(w http.ResponseWriter, req *http.Request) {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	// Bootstrap successfully completed: clear the ephemeral bootstrap token from memory
+	r.bootstrapToken = ""
 
 	r.auditLogger.Log(req.Context(), r.getActor(req), "CREATE_API_KEY", "api_key", keyModel.ID, keyModel, req.RemoteAddr)
 

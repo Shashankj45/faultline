@@ -76,3 +76,65 @@ func TestAuthServiceAuthenticationAndRoles(t *testing.T) {
 	// Wait briefly to allow async goroutine to update last_used_at without panic
 	time.Sleep(50 * time.Millisecond)
 }
+
+func TestRevokedKeyRejectionAndRotation(t *testing.T) {
+	sqlStore, err := store.NewSQLStore("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer sqlStore.Close()
+
+	authService := NewAuthService(sqlStore)
+	ctx := context.Background()
+
+	// 1. Generate initial admin key
+	oldRawKey, oldKeyModel, err := GenerateAPIKey("Old Admin Key", models.RoleAdmin, nil)
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+	if err := sqlStore.CreateAPIKey(ctx, oldKeyModel); err != nil {
+		t.Fatalf("failed to insert key: %v", err)
+	}
+
+	// Verify old key works initially
+	reqOld := httptest.NewRequest("GET", "/api/v1/upstreams", nil)
+	reqOld.Header.Set("X-API-Key", oldRawKey)
+	k, err := authService.Authenticate(reqOld)
+	if err != nil || k.ID != oldKeyModel.ID {
+		t.Fatalf("expected old key to work initially, got error: %v", err)
+	}
+
+	// 2. Revoke the old key
+	if err := sqlStore.RevokeAPIKey(ctx, oldKeyModel.ID); err != nil {
+		t.Fatalf("failed to revoke old key: %v", err)
+	}
+
+	// Verify old key immediately fails authentication
+	_, errRevoked := authService.Authenticate(reqOld)
+	if errRevoked != ErrUnauthorized {
+		t.Fatalf("expected ErrUnauthorized for revoked key, got %v", errRevoked)
+	}
+
+	// 3. Provision new replacement key (rotation)
+	newRawKey, newKeyModel, err := GenerateAPIKey("Rotated Replacement Admin Key", models.RoleAdmin, nil)
+	if err != nil {
+		t.Fatalf("failed to generate replacement key: %v", err)
+	}
+	if err := sqlStore.CreateAPIKey(ctx, newKeyModel); err != nil {
+		t.Fatalf("failed to insert replacement key: %v", err)
+	}
+
+	// 4. Verify replacement key succeeds
+	reqNew := httptest.NewRequest("GET", "/api/v1/upstreams", nil)
+	reqNew.Header.Set("X-API-Key", newRawKey)
+	kNew, errNew := authService.Authenticate(reqNew)
+	if errNew != nil || kNew.ID != newKeyModel.ID {
+		t.Fatalf("expected replacement key to succeed, got error: %v", errNew)
+	}
+
+	// 5. Verify old key STILL fails
+	_, errOldAgain := authService.Authenticate(reqOld)
+	if errOldAgain != ErrUnauthorized {
+		t.Fatalf("expected old key to remain rejected after rotation, got %v", errOldAgain)
+	}
+}

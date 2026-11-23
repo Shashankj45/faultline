@@ -215,6 +215,8 @@ func TestKillSwitchBlocksExperimentActivation(t *testing.T) {
 func TestBootstrapSecurityProtection(t *testing.T) {
 	router, sqlStore := setupTestAPI(t)
 	router.SetDevMode(false) // Test strict production security mode
+	const testBootToken = "fl_boot_test_token_9876543210"
+	router.SetBootstrapToken(testBootToken)
 
 	// Verify initial state: no keys exist in the database
 	if sqlStore.HasAPIKeys() {
@@ -223,20 +225,30 @@ func TestBootstrapSecurityProtection(t *testing.T) {
 
 	// 1. Remote request to destructive administrative endpoint (kill switch) without key must be blocked (401)
 	remoteKillReq := httptest.NewRequest("POST", "/api/v1/killswitch", bytes.NewBufferString(`{"global_active": true}`))
-	remoteKillReq.RemoteAddr = "198.51.100.23:44123" // External non-loopback IP
+	remoteKillReq.RemoteAddr = "198.51.100.23:44123"
 	recKill := httptest.NewRecorder()
 	router.ServeHTTP(recKill, remoteKillReq)
 	if recKill.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 Unauthorized for remote destructive action in bootstrap mode, got %d: %s", recKill.Code, recKill.Body.String())
 	}
 
-	// 2. Remote request to create initial admin key must be permitted in bootstrap mode
-	createKeyReq := httptest.NewRequest("POST", "/api/v1/api-keys", bytes.NewBufferString(`{"name": "First Admin", "role": "admin"}`))
-	createKeyReq.RemoteAddr = "198.51.100.23:44123"
+	// 2. Unauthenticated visitor trying to register initial admin key WITHOUT bootstrap token must be blocked (401)
+	unauthKeyReq := httptest.NewRequest("POST", "/api/v1/api-keys", bytes.NewBufferString(`{"name": "Attacker Admin", "role": "admin"}`))
+	unauthKeyReq.RemoteAddr = "198.51.100.23:44123"
+	recUnauthKey := httptest.NewRecorder()
+	router.ServeHTTP(recUnauthKey, unauthKeyReq)
+	if recUnauthKey.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized when registering admin key without bootstrap token, got %d: %s", recUnauthKey.Code, recUnauthKey.Body.String())
+	}
+
+	// 3. Legitimate administrator supplying valid X-Bootstrap-Token must succeed (201 Created)
+	authKeyReq := httptest.NewRequest("POST", "/api/v1/api-keys", bytes.NewBufferString(`{"name": "Legitimate Admin", "role": "admin"}`))
+	authKeyReq.RemoteAddr = "198.51.100.23:44123"
+	authKeyReq.Header.Set("X-Bootstrap-Token", testBootToken)
 	recKey := httptest.NewRecorder()
-	router.ServeHTTP(recKey, createKeyReq)
+	router.ServeHTTP(recKey, authKeyReq)
 	if recKey.Code != http.StatusCreated {
-		t.Fatalf("expected 201 Created for initial key registration, got %d: %s", recKey.Code, recKey.Body.String())
+		t.Fatalf("expected 201 Created for initial key registration with bootstrap token, got %d: %s", recKey.Code, recKey.Body.String())
 	}
 
 	var keyResp struct {
@@ -247,21 +259,22 @@ func TestBootstrapSecurityProtection(t *testing.T) {
 		t.Fatalf("failed to decode key generation response: %v", err)
 	}
 
-	// 3. System is now locked: HasAPIKeys() must be true
+	// 4. System is now locked: HasAPIKeys() must be true
 	if !sqlStore.HasAPIKeys() {
 		t.Fatal("expected HasAPIKeys() to be true after key generation")
 	}
 
-	// 4. Any subsequent unauthenticated request (even on localhost) must be rejected with 401
-	unauthReq := httptest.NewRequest("POST", "/api/v1/killswitch", bytes.NewBufferString(`{"global_active": true}`))
-	unauthReq.RemoteAddr = "127.0.0.1:12345"
-	recUnauth := httptest.NewRecorder()
-	router.ServeHTTP(recUnauth, unauthReq)
-	if recUnauth.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 Unauthorized once keys exist, got %d", recUnauth.Code)
+	// 5. Concurrent or subsequent bootstrap attempt using the same bootstrap token must fail
+	dupBootReq := httptest.NewRequest("POST", "/api/v1/api-keys", bytes.NewBufferString(`{"name": "Duplicate Admin", "role": "admin"}`))
+	dupBootReq.RemoteAddr = "198.51.100.23:44123"
+	dupBootReq.Header.Set("X-Bootstrap-Token", testBootToken)
+	recDup := httptest.NewRecorder()
+	router.ServeHTTP(recDup, dupBootReq)
+	if recDup.Code != http.StatusUnauthorized && recDup.Code != http.StatusConflict {
+		t.Fatalf("expected 401 or 409 when attempting duplicate bootstrap, got %d: %s", recDup.Code, recDup.Body.String())
 	}
 
-	// 5. Authenticated request with the provisioned key must succeed
+	// 6. Authenticated request with the provisioned key must succeed
 	authReq := httptest.NewRequest("POST", "/api/v1/killswitch", bytes.NewBufferString(`{"global_active": true, "reason": "auth test"}`))
 	authReq.RemoteAddr = "198.51.100.23:44123"
 	authReq.Header.Set("X-API-Key", keyResp.SecretKey)

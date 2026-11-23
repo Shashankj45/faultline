@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -100,6 +102,20 @@ func main() {
 
 	// 4. API & Control Plane Router
 	apiRouter := api.NewRouter(sqlStore, reverseProxyServer, healthMonitor, metricsCollector, auditLogger, authService)
+
+	// If no keys exist and no admin token was supplied, generate an ephemeral bootstrap token
+	if !sqlStore.HasAPIKeys() {
+		bootBytes := make([]byte, 16)
+		if _, err := rand.Read(bootBytes); err == nil {
+			bootToken := fmt.Sprintf("fl_boot_%s", hex.EncodeToString(bootBytes))
+			apiRouter.SetBootstrapToken(bootToken)
+			log.Println("[SECURITY] ==========================================================================")
+			log.Println("[SECURITY] BOOTSTRAP ACTIVE: Database has no registered API keys.")
+			log.Printf( "[SECURITY] Ephemeral Setup Token: %s", bootToken)
+			log.Println("[SECURITY] Pass header 'X-Bootstrap-Token: <token>' to POST /api/v1/api-keys to initialize.")
+			log.Println("[SECURITY] ==========================================================================")
+		}
+	}
 
 	// 5. Root Multiplexer
 	rootMux := http.NewServeMux()
