@@ -28,4 +28,4 @@ COPY --from=frontend-builder /app/web/dist /app/web/dist
 EXPOSE 8080
 
 ENTRYPOINT ["/app/faultline"]
-CMD ["-port", "8080", "-static-dir", "/app/web/dist"]
+CMD ["-static-dir", "/app/web/dist"]

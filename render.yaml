@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: faultline-chaos-proxy
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: FAULTLINE_MOCK_SERVICES
+        value: "true"
