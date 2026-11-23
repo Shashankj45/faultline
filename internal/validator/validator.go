@@ -18,6 +18,7 @@ var (
 	ErrInvalidScheme            = errors.New("invalid scheme: only http and https are allowed")
 	ErrEmptyHost                = errors.New("upstream host cannot be empty")
 	ErrInvalidPort              = errors.New("upstream port must be between 1 and 65535")
+	ErrUnspecifiedIPBlocked     = errors.New("security violation: unspecified 0.0.0.0 or :: address is permanently prohibited")
 	ErrMetadataBlocked          = errors.New("security violation: cloud metadata endpoint is permanently prohibited")
 	ErrLinkLocalBlocked         = errors.New("security violation: link-local IP addresses are permanently prohibited")
 	ErrLocalhostDisallowed      = errors.New("security policy: loopback / localhost is not permitted for this upstream")
@@ -28,6 +29,17 @@ var (
 var (
 	// Metadata IP (AWS, GCP, Azure, DigitalOcean)
 	metadataIP = net.ParseIP("169.254.169.254")
+
+	metadataCIDRs = []*net.IPNet{
+		mustParseCIDR("169.254.169.254/32"), // IMDSv4 (AWS, GCP, Azure, DO)
+		mustParseCIDR("168.63.129.16/32"),   // Azure Wireserver / Host Agent
+		mustParseCIDR("fd00:ec2::254/128"),  // AWS IMDSv6
+	}
+
+	unspecifiedCIDRs = []*net.IPNet{
+		mustParseCIDR("0.0.0.0/8"),
+		mustParseCIDR("::/128"),
+	}
 
 	// Disallowed IP CIDRs
 	linkLocalCIDRs = []*net.IPNet{
@@ -131,26 +143,41 @@ func CheckIPAllowed(ip net.IP, allowLocalhost, allowPrivate bool) error {
 		ip = v4
 	}
 
-	// 1. Cloud Metadata protection (permanent block)
+	// 1. Unspecified address protection (permanent block: 0.0.0.0, ::)
+	if ip.IsUnspecified() {
+		return ErrUnspecifiedIPBlocked
+	}
+	for _, cidr := range unspecifiedCIDRs {
+		if cidr.Contains(ip) {
+			return ErrUnspecifiedIPBlocked
+		}
+	}
+
+	// 2. Cloud Metadata protection (permanent block: IMDSv4, IMDSv6, Azure Wireserver)
 	if ip.Equal(metadataIP) {
 		return ErrMetadataBlocked
 	}
+	for _, cidr := range metadataCIDRs {
+		if cidr.Contains(ip) {
+			return ErrMetadataBlocked
+		}
+	}
 
-	// 2. Link-local protection (permanent block)
+	// 3. Link-local protection (permanent block)
 	for _, cidr := range linkLocalCIDRs {
 		if cidr.Contains(ip) {
 			return ErrLinkLocalBlocked
 		}
 	}
 
-	// 3. Multicast / Broadcast protection
+	// 4. Multicast / Broadcast protection
 	for _, cidr := range multicastBroadcastCIDRs {
 		if cidr.Contains(ip) {
 			return errors.New("security violation: multicast or broadcast IP is not allowed")
 		}
 	}
 
-	// 4. Loopback / Localhost validation
+	// 5. Loopback / Localhost validation
 	for _, cidr := range loopbackCIDRs {
 		if cidr.Contains(ip) {
 			if !allowLocalhost {
@@ -160,7 +187,7 @@ func CheckIPAllowed(ip net.IP, allowLocalhost, allowPrivate bool) error {
 		}
 	}
 
-	// 5. Private network validation
+	// 6. Private network validation
 	for _, cidr := range privateCIDRs {
 		if cidr.Contains(ip) {
 			if !allowPrivate {
@@ -175,6 +202,7 @@ func CheckIPAllowed(ip net.IP, allowLocalhost, allowPrivate bool) error {
 
 // SafeDialer creates a net.Dialer that prevents DNS Rebinding attacks by re-checking
 // the destination IP at TCP connect time inside Control.
+// Fails closed if the destination address cannot be validated as a legal IP.
 func SafeDialer(upstream *models.Upstream, timeout time.Duration) *net.Dialer {
 	return &net.Dialer{
 		Timeout:   timeout,
@@ -185,10 +213,11 @@ func SafeDialer(upstream *models.Upstream, timeout time.Duration) *net.Dialer {
 				return fmt.Errorf("invalid socket address %q: %w", address, err)
 			}
 			ip := net.ParseIP(host)
-			if ip != nil {
-				if err := CheckIPAllowed(ip, upstream.AllowLocalhost, upstream.AllowPrivateNetwork); err != nil {
-					return fmt.Errorf("dns rebinding / SSRF blocked at socket connection: %w", err)
-				}
+			if ip == nil {
+				return fmt.Errorf("security violation: destination socket address %q does not contain a valid resolved IP", address)
+			}
+			if err := CheckIPAllowed(ip, upstream.AllowLocalhost, upstream.AllowPrivateNetwork); err != nil {
+				return fmt.Errorf("dns rebinding / SSRF blocked at socket connection: %w", err)
 			}
 			return nil
 		},

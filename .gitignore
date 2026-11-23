@@ -12,8 +12,19 @@ faultline
 # Database files
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 test_verify.db
 faultline.db
+
+# Environment & Credentials
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.crt
+*.cert
 
 # Dependencies
 vendor/

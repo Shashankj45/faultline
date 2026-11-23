@@ -221,3 +221,58 @@ func TestProxyLatencyInjection(t *testing.T) {
 		t.Fatalf("expected 200 OK after delay, got %d", rec.Code)
 	}
 }
+
+func TestProxyLoopDetection(t *testing.T) {
+	proxyServer, _, _ := setupTestProxy(t)
+
+	// Send request with hops count >= 10
+	req := httptest.NewRequest("GET", "/proxy/test-backend/loop", nil)
+	req.Header.Set("X-FaultLine-Hops", "10")
+	rec := httptest.NewRecorder()
+
+	proxyServer.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusLoopDetected {
+		t.Fatalf("expected 508 Loop Detected, got %d", rec.Code)
+	}
+}
+
+func TestProxyEviction(t *testing.T) {
+	proxyServer, sqlStore, _ := setupTestProxy(t)
+
+	// Make request to populate cache
+	req := httptest.NewRequest("GET", "/proxy/test-backend/ping", nil)
+	rec := httptest.NewRecorder()
+	proxyServer.ServeHTTP(rec, req)
+
+	proxyServer.proxiesMu.RLock()
+	_, found := proxyServer.proxies["u-backend"]
+	proxyServer.proxiesMu.RUnlock()
+	if !found {
+		t.Fatal("expected u-backend to be cached in reverse proxy map")
+	}
+
+	// Evict proxy
+	proxyServer.EvictProxy("u-backend")
+
+	proxyServer.proxiesMu.RLock()
+	_, foundAfter := proxyServer.proxies["u-backend"]
+	proxyServer.proxiesMu.RUnlock()
+	if foundAfter {
+		t.Fatal("expected u-backend to be evicted from reverse proxy map")
+	}
+	_ = sqlStore
+}
+
+func TestHijackerInterface(t *testing.T) {
+	rec := &statusRecorder{
+		ResponseWriter: httptest.NewRecorder(),
+	}
+	// Verify it satisfies http.Hijacker
+	var _ http.Hijacker = rec
+
+	pl := &packetLossResponseWriter{
+		ResponseWriter: httptest.NewRecorder(),
+	}
+	var _ http.Hijacker = pl
+}

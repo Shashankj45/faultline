@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/faultline-proxy/faultline/internal/metrics"
+	"github.com/faultline-proxy/faultline/internal/validator"
 	"github.com/faultline-proxy/faultline/pkg/models"
 )
 
@@ -15,7 +16,6 @@ import (
 type Monitor struct {
 	mu       sync.RWMutex
 	statuses map[string]*models.UpstreamHealth // key: upstream_id
-	client   *http.Client
 	metrics  *metrics.Metrics
 	stopCh   chan struct{}
 }
@@ -24,11 +24,8 @@ type Monitor struct {
 func NewMonitor(m *metrics.Metrics) *Monitor {
 	return &Monitor{
 		statuses: make(map[string]*models.UpstreamHealth),
-		client: &http.Client{
-			Timeout: 5 * time.Second,
-		},
-		metrics: m,
-		stopCh:  make(chan struct{}),
+		metrics:  m,
+		stopCh:   make(chan struct{}),
 	}
 }
 
@@ -68,15 +65,30 @@ func (mon *Monitor) probeUpstream(u models.Upstream) {
 	}
 	probeURL := fmt.Sprintf("%s%s", u.TargetURL, probePath)
 
-	start := time.Now()
-	req, err := http.NewRequestWithContext(context.Background(), "GET", probeURL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", probeURL, nil)
 	if err != nil {
 		mon.recordResult(u.ID, u.Slug, false, 0, 0, err.Error())
 		return
 	}
 	req.Header.Set("User-Agent", "FaultLine-HealthProbe/1.0")
 
-	resp, err := mon.client.Do(req)
+	// Use SSRF-safe dialer ensuring health checks cannot probe internal cloud metadata
+	// or unauthorized networks via DNS rebinding.
+	probeTransport := &http.Transport{
+		DialContext:           validator.SafeDialer(&u, 5*time.Second).DialContext,
+		ResponseHeaderTimeout: 5 * time.Second,
+		DisableKeepAlives:     true,
+	}
+	probeClient := &http.Client{
+		Transport: probeTransport,
+		Timeout:   5 * time.Second,
+	}
+
+	start := time.Now()
+	resp, err := probeClient.Do(req)
 	latency := time.Since(start)
 
 	if err != nil {
@@ -102,7 +114,7 @@ func (mon *Monitor) recordResult(upstreamID, slug string, healthy bool, statusCo
 	if !ok {
 		st = &models.UpstreamHealth{
 			UpstreamID: upstreamID,
-			Healthy:    true,
+			Healthy:    false, // Default to unhealthy until verified by a successful probe
 		}
 		mon.statuses[upstreamID] = st
 	}

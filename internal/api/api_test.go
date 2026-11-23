@@ -156,3 +156,57 @@ func TestAPIExperimentLifecycle(t *testing.T) {
 		t.Fatalf("expected status 'running', got %s", exp.Status)
 	}
 }
+
+func TestKillSwitchBlocksExperimentActivation(t *testing.T) {
+	router, sqlStore := setupTestAPI(t)
+	ctx := context.Background()
+
+	// 1. Pre-seed upstream and experiment
+	u := &models.Upstream{
+		ID:        "u-ks-test",
+		Name:      "KS Test Upstream",
+		Slug:      "ks-test",
+		TargetURL: "https://example.com",
+		IsActive:  true,
+	}
+	_ = sqlStore.CreateUpstream(ctx, u)
+
+	exp := &models.Experiment{
+		ID:         "exp-ks-blocked",
+		UpstreamID: "u-ks-test",
+		Name:       "Blocked Under Kill Switch",
+		Status:     models.StatusDraft,
+	}
+	_ = sqlStore.CreateExperiment(ctx, exp)
+
+	// 2. Engage Emergency Kill Switch
+	_ = sqlStore.SetKillSwitch(ctx, &models.KillSwitchState{
+		GlobalActive: true,
+		ActivatedBy:  "lead-engineer",
+		Reason:       "emergency test",
+	})
+
+	// 3. Attempt to transition draft experiment to running -> Must be rejected with 409 Conflict
+	statusPayload := `{"status": "running"}`
+	req := httptest.NewRequest("POST", "/api/v1/experiments/exp-ks-blocked/status", bytes.NewBufferString(statusPayload))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when activating experiment under kill switch, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 4. Attempt to create a new experiment directly with status 'running' -> Must be rejected with 409 Conflict
+	createRunningPayload := `{
+		"upstream_id": "u-ks-test",
+		"name": "Direct Running Experiment",
+		"status": "running"
+	}`
+	req = httptest.NewRequest("POST", "/api/v1/experiments", bytes.NewBufferString(createRunningPayload))
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when creating running experiment under kill switch, got %d: %s", rec.Code, rec.Body.String())
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/faultline-proxy/faultline/pkg/models"
@@ -31,6 +32,9 @@ type SQLStore struct {
 	upstreamIDs map[string]*models.Upstream // key: id
 	activeRules map[string][]models.FaultRule // key: upstream_id
 	killSwitch  models.KillSwitchState
+
+	// Atomic flag indicating whether any active API keys exist for lock-free RBAC bootstrap checks
+	hasAPIKeys atomic.Bool
 }
 
 // NewSQLStore creates a new SQL store, runs schema migrations, and primes the hot-cache.
@@ -44,9 +48,13 @@ func NewSQLStore(driverName, dataSourceName string) (*SQLStore, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Connection pool tuning
+	// Connection pool tuning and engine pragma configuration
 	if driverName == "sqlite" {
 		db.SetMaxOpenConns(1) // SQLite single-writer safety
+		// Enforce referential integrity (cascades), concurrency WAL journal, and busy timeout
+		if _, err := db.Exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;"); err != nil {
+			return nil, fmt.Errorf("failed to configure sqlite pragmas: %w", err)
+		}
 	} else {
 		db.SetMaxOpenConns(25)
 		db.SetMaxIdleConns(10)
@@ -241,7 +249,18 @@ func (s *SQLStore) ReloadCache(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
+	// Prime the active API key presence flag for O(1) bootstrap checks
+	var keyCount int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM api_keys WHERE is_active = 1").Scan(&keyCount); err == nil {
+		s.hasAPIKeys.Store(keyCount > 0)
+	}
+
 	return nil
+}
+
+// HasAPIKeys returns true if any active API keys are registered, enabling O(1) lock-free RBAC bootstrap checks.
+func (s *SQLStore) HasAPIKeys() bool {
+	return s.hasAPIKeys.Load()
 }
 
 // CachedUpstreamBySlug retrieves an upstream from memory with O(1) complexity.
@@ -960,6 +979,9 @@ func (s *SQLStore) CreateAPIKey(ctx context.Context, k *models.APIKey) error {
 		}
 		return err
 	}
+	if k.IsActive {
+		s.hasAPIKeys.Store(true)
+	}
 	return nil
 }
 
@@ -1016,6 +1038,13 @@ func (s *SQLStore) RevokeAPIKey(ctx context.Context, id string) error {
 	if rows == 0 {
 		return ErrNotFound
 	}
+
+	// Update cached active API key presence
+	var count int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM api_keys WHERE is_active = 1").Scan(&count); err == nil {
+		s.hasAPIKeys.Store(count > 0)
+	}
+
 	return nil
 }
 

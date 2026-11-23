@@ -138,8 +138,9 @@ func TestThrottledStream(t *testing.T) {
 	data := bytes.Repeat([]byte("A"), 1024) // 1KB
 	reader := bytes.NewReader(data)
 
+	ctx := context.Background()
 	// Throttle at 20KB/s
-	throttled := WrapThrottledReader(reader, 20*1024)
+	throttled := WrapThrottledReader(ctx, reader, 20*1024)
 	buf := make([]byte, 512)
 	n, err := throttled.Read(buf)
 	if err != nil && err != io.EOF {
@@ -147,5 +148,14 @@ func TestThrottledStream(t *testing.T) {
 	}
 	if n != 512 {
 		t.Fatalf("expected 512 bytes, got %d", n)
+	}
+
+	// Verify context cancellation interrupts throttled reader
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+	throttledCanceled := WrapThrottledReader(cancelCtx, bytes.NewReader(data), 100)
+	_, cancelErr := throttledCanceled.Read(buf)
+	if cancelErr == nil {
+		t.Fatal("expected error on read with canceled context, got nil")
 	}
 }

@@ -1,7 +1,8 @@
 package proxy
 
 import (
-	"bytes"
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,9 +49,33 @@ func NewReverseProxyServer(s *store.SQLStore, engine *faults.Engine, m *metrics.
 	}
 }
 
+// EvictProxy invalidates the cached ReverseProxy instance for an upstream (e.g. after configuration or target updates).
+func (p *ReverseProxyServer) EvictProxy(upstreamID string) {
+	p.proxiesMu.Lock()
+	delete(p.proxies, upstreamID)
+	p.proxiesMu.Unlock()
+}
+
 // ServeHTTP handles incoming reverse proxy traffic.
 func (p *ReverseProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+
+	// 0. Loop Detection & Safety Body Limits
+	const maxProxyHops = 10
+	hops := 0
+	if hopsStr := r.Header.Get("X-FaultLine-Hops"); hopsStr != "" {
+		if h, err := strconv.Atoi(hopsStr); err == nil {
+			hops = h
+		}
+	}
+	if hops >= maxProxyHops {
+		http.Error(w, `{"error":"Proxy loop detected: maximum hop limit exceeded","status":508}`, http.StatusLoopDetected)
+		return
+	}
+
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, 32<<20) // 32MB payload cap
+	}
 
 	// 1. Resolve Target Upstream
 	upstream, strippedPath, ok := p.resolveUpstream(r)
@@ -157,7 +182,7 @@ func (p *ReverseProxyServer) executePreUpstreamFault(w http.ResponseWriter, r *h
 		if err := json.Unmarshal(rule.Config, &cfg); err == nil {
 			if cfg.Direction == models.BandwidthUpstream && r.Body != nil {
 				p.metrics.RecordInjectedFault(upstream.Slug, rule.ExperimentID, string(models.FaultBandwidthLimit))
-				r.Body = io.NopCloser(faults.WrapThrottledReader(r.Body, cfg.RateBytesPerSec))
+				r.Body = io.NopCloser(faults.WrapThrottledReader(r.Context(), r.Body, cfg.RateBytesPerSec))
 			}
 		}
 		return false
@@ -204,8 +229,15 @@ func (p *ReverseProxyServer) executePreUpstreamFault(w http.ResponseWriter, r *h
 func (p *ReverseProxyServer) forwardRequest(w http.ResponseWriter, r *http.Request, upstream *models.Upstream, path string, matchedRule *models.FaultRule, start time.Time) {
 	proxy := p.getOrCreateReverseProxy(upstream)
 
-	// Adjust request path
+	// Adjust request path and track proxy hops
 	r.URL.Path = path
+	hops := 0
+	if hopsStr := r.Header.Get("X-FaultLine-Hops"); hopsStr != "" {
+		if h, err := strconv.Atoi(hopsStr); err == nil {
+			hops = h
+		}
+	}
+	r.Header.Set("X-FaultLine-Hops", strconv.Itoa(hops+1))
 	r.Header.Set("X-Forwarded-Host", r.Host)
 	r.Header.Set("X-Forwarded-Proto", "http")
 	if r.TLS != nil {
@@ -284,9 +316,13 @@ func (p *ReverseProxyServer) getOrCreateReverseProxy(upstream *models.Upstream) 
 		return nil
 	}
 	revProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) {
+			// Client disconnected prematurely; terminate silently without leaking headers
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
-		_, _ = fmt.Fprintf(w, `{"error":"Upstream Gateway Error","details":%q,"status":502}`, err.Error())
+		_, _ = fmt.Fprintf(w, `{"error":"Upstream Gateway Error","status":502}`)
 	}
 
 	p.proxies[upstream.ID] = revProxy
@@ -363,6 +399,14 @@ func (pl *packetLossResponseWriter) Flush() {
 	}
 }
 
+// Hijack delegates to underlying ResponseWriter if supported, preserving standard http.Hijacker contract.
+func (pl *packetLossResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := pl.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, errors.New("underlying ResponseWriter does not support http.Hijacker")
+}
+
 type statusRecorder struct {
 	http.ResponseWriter
 	statusCode int
@@ -384,17 +428,12 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
-// Hijack delegates to underlying ResponseWriter if supported
-func (r *statusRecorder) Hijack() (net.Conn, *bytes.Buffer, error) {
+// Hijack delegates to underlying ResponseWriter if supported, preserving standard http.Hijacker contract.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if h, ok := r.ResponseWriter.(http.Hijacker); ok {
-		c, rw, err := h.Hijack()
-		if err != nil {
-			return nil, nil, err
-		}
-		// Convert bufio to bytes.Buffer or return connection
-		return c, bytes.NewBuffer(nil), rw.Flush()
+		return h.Hijack()
 	}
-	return nil, nil, errors.New("hijack not supported")
+	return nil, nil, errors.New("underlying ResponseWriter does not support http.Hijacker")
 }
 
 func (r *statusRecorder) Flush() {

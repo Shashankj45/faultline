@@ -271,18 +271,20 @@ func (e *Engine) InjectTimeout(ctx context.Context, w http.ResponseWriter, cfg *
 }
 
 // WrapThrottledReader wraps an io.Reader (like request body) with a token-bucket rate limiter.
-func WrapThrottledReader(r io.Reader, bytesPerSec int64) io.Reader {
+func WrapThrottledReader(ctx context.Context, r io.Reader, bytesPerSec int64) io.Reader {
 	if bytesPerSec <= 0 {
 		return r
 	}
 	limiter := rate.NewLimiter(rate.Limit(bytesPerSec), int(bytesPerSec))
 	return &throttledReader{
+		ctx:     ctx,
 		r:       r,
 		limiter: limiter,
 	}
 }
 
 type throttledReader struct {
+	ctx     context.Context
 	r       io.Reader
 	limiter *rate.Limiter
 }
@@ -290,32 +292,44 @@ type throttledReader struct {
 func (tr *throttledReader) Read(p []byte) (int, error) {
 	n, err := tr.r.Read(p)
 	if n > 0 {
-		ctx := context.Background()
-		_ = tr.limiter.WaitN(ctx, n)
+		ctx := tr.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if waitErr := tr.limiter.WaitN(ctx, n); waitErr != nil {
+			return n, waitErr
+		}
 	}
 	return n, err
 }
 
 // WrapThrottledWriter wraps an io.Writer with a token-bucket rate limiter.
-func WrapThrottledWriter(w io.Writer, bytesPerSec int64) io.Writer {
+func WrapThrottledWriter(ctx context.Context, w io.Writer, bytesPerSec int64) io.Writer {
 	if bytesPerSec <= 0 {
 		return w
 	}
 	limiter := rate.NewLimiter(rate.Limit(bytesPerSec), int(bytesPerSec))
 	return &throttledWriter{
+		ctx:     ctx,
 		w:       w,
 		limiter: limiter,
 	}
 }
 
 type throttledWriter struct {
+	ctx     context.Context
 	w       io.Writer
 	limiter *rate.Limiter
 }
 
 func (tw *throttledWriter) Write(p []byte) (int, error) {
-	ctx := context.Background()
-	_ = tw.limiter.WaitN(ctx, len(p))
+	ctx := tw.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := tw.limiter.WaitN(ctx, len(p)); err != nil {
+		return 0, err
+	}
 	return tw.w.Write(p)
 }
 

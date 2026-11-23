@@ -227,6 +227,10 @@ func TestSQLStoreAuditLogsAndAPIKeys(t *testing.T) {
 	}
 
 	// API Keys
+	if store.HasAPIKeys() {
+		t.Fatal("expected HasAPIKeys to be false initially")
+	}
+
 	apiKey := &models.APIKey{
 		ID:        "key-1",
 		Name:      "CI/CD Runner",
@@ -238,6 +242,10 @@ func TestSQLStoreAuditLogsAndAPIKeys(t *testing.T) {
 	}
 	if err := store.CreateAPIKey(ctx, apiKey); err != nil {
 		t.Fatalf("create api key failed: %v", err)
+	}
+
+	if !store.HasAPIKeys() {
+		t.Fatal("expected HasAPIKeys to be true after key creation")
 	}
 
 	fetchedKey, err := store.GetAPIKeyByHash(ctx, "hash_abc_123")
@@ -254,5 +262,21 @@ func TestSQLStoreAuditLogsAndAPIKeys(t *testing.T) {
 	revokedKey, _ := store.GetAPIKeyByHash(ctx, "hash_abc_123")
 	if revokedKey.IsActive {
 		t.Fatal("expected revoked api key to have is_active = false")
+	}
+
+	if store.HasAPIKeys() {
+		t.Fatal("expected HasAPIKeys to be false after revoking all active keys")
+	}
+}
+
+func TestSQLiteForeignKeysEnabled(t *testing.T) {
+	store := newTestStore(t)
+	var fk int
+	err := store.db.QueryRow("PRAGMA foreign_keys;").Scan(&fk)
+	if err != nil {
+		t.Fatalf("failed to query foreign_keys pragma: %v", err)
+	}
+	if fk != 1 {
+		t.Fatalf("expected PRAGMA foreign_keys = 1, got %d", fk)
 	}
 }

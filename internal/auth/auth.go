@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -101,9 +102,11 @@ func (a *AuthService) Authenticate(r *http.Request) (*models.APIKey, error) {
 		return nil, ErrUnauthorized
 	}
 
-	// Update last used time asynchronously
+	// Update last used time asynchronously with a bounded detached context to prevent premature cancellation
 	go func(id string) {
-		_ = a.store.UpdateAPIKeyLastUsed(r.Context(), id, time.Now().UTC())
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = a.store.UpdateAPIKeyLastUsed(ctx, id, time.Now().UTC())
 	}(apiKey.ID)
 
 	return apiKey, nil

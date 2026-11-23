@@ -72,27 +72,38 @@ flowchart TD
 
 ### 2. Security-First Architecture & SSRF Defenses
 - **SSRF (Server-Side Request Forgery) Prevention**: FaultLine rejects all unregistered target destinations by default.
-- **Private Network & Loopback Protection**: Prohibits requests to loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`), cloud metadata (`169.254.169.254`), and private RFC 1918 ranges unless explicitly authorized per upstream via strict configuration flags (`allow_localhost`, `allow_private_network`).
-- **DNS Rebinding Defense (`SafeDialer`)**: Domain names pointing to legitimate external IPs during registration can rebind to loopback or metadata IPs at dial time. FaultLine mitigates this through a custom `net.Dialer.Control` socket hook that resolves and re-verifies the target IP address immediately prior to socket connection.
-- **Role-Based Access Control (RBAC)**: Distinguishes between `Admin` (full system control), `Operator` (experiment start/stop, kill switch), and `Viewer` (read-only telemetry).
+- **Fail-Closed Socket-Level DNS Rebinding Defense (`SafeDialer`)**: Domain names pointing to legitimate external IPs during registration can rebind to loopback or metadata IPs at dial time (TOCTOU). FaultLine enforces connection-time validation inside `net.Dialer.Control` socket hooks, strictly failing closed if any socket destination cannot be verified as an authorized IP.
+- **Extended Infrastructure Blacklisting**: Permanently prohibits requests to:
+  - AWS/GCP/Azure IMDSv4 (`169.254.169.254/32`) and AWS IMDSv6 (`fd00:ec2::254/128`).
+  - Azure Wireserver Host Agent (`168.63.129.16/32`).
+  - Unspecified networks (`0.0.0.0/8`, `::/128`) which route to loopback on host OS network stacks.
+  - Link-local (`169.254.0.0/16`, `fe80::/10`) and multicast/broadcast ranges.
+  - RFC 1918 private ranges unless explicitly authorized per upstream via strict configuration flags (`allow_localhost`, `allow_private_network`).
+- **SSRF-Hardened Upstream Health Probing**: Health check monitor probes dispatch through isolated, SSRF-validated `SafeDialer` transports, ensuring that upstream DNS rebinds cannot probe internal cloud metadata via background health checks.
+- **Proxy Loop Detection & Ingress Safety Bounds**: Tracks `X-FaultLine-Hops` header up to a strict ceiling of 10 hops (`508 Loop Detected`), and caps inbound request bodies at 32MB via `http.MaxBytesReader` to prevent memory exhaustion attacks.
+- **Role-Based Access Control (RBAC) & $O(1)$ Atomic Bootstrap**: Distinguishes between `Admin`, `Operator`, and `Viewer` tiers. The bootstrap mode check is mediated by an atomic in-memory flag (`hasAPIKeys atomic.Bool`), ensuring $O(1)$ lock-free authentication without database table scans on each request.
 
 ### 3. Comprehensive Chaos Scenarios
 | Chaos Scenario | Description | Configuration Details |
 | :--- | :--- | :--- |
-| **Artificial Latency** | Delays requests to simulate slow edge networks, overloaded backends, or routing hops. | Supports `fixed`, `uniform jitter` (min/max), `gaussian` (mean/stddev), and `gradual ramp` over experiment duration. |
+| **Artificial Latency** | Delays requests to simulate slow edge networks, overloaded backends, or routing hops. | Supports `fixed`, `uniform jitter` (min/max), `gaussian` (mean/stddev), and `gradual ramp` over experiment duration. Context-aware cancellation. |
 | **HTTP Error Injection** | Injects custom HTTP error statuses and payloads without calling the upstream service. | Custom status codes (`500`, `502`, `503`, `504`, `429`), custom JSON bodies, and headers (`Retry-After`). |
-| **Connection Drops / TCP RST** | Simulates abrupt connection drops, socket crashes, or network partitioning. | Raw socket hijacking (`TCP RST` via `SetLinger(0)`, `Empty EOF`, `Partial Body`, `Malformed Bytes`). |
+| **Connection Drops / TCP RST** | Simulates abrupt connection drops, socket crashes, or network partitioning. | Raw socket hijacking (`TCP RST` via `SetLinger(0)`, `Empty EOF`, `Partial Body`, `Malformed Bytes`). Fully implements `http.Hijacker`. |
 | **Timeout Simulation** | Simulates hung connections or slow upstream gateways. | `Client Stall` (holds connection), `504 Gateway Timeout` (delays then returns 504), and `Drip-Feed` (Slowloris chunks). |
-| **Bandwidth Throttling** | Throttles ingress upload or egress download bandwidth to simulate cellular/edge links. | Token-bucket rate limiting (`rate.Limiter`) on stream readers and response writers. |
+| **Bandwidth Throttling** | Throttles ingress upload or egress download bandwidth to simulate cellular/edge links. | Token-bucket rate limiting (`rate.Limiter`) on stream readers and response writers with immediate context cancellation on client abort. |
 | **Burst Spikes** | Injects periodic failure spikes for a duration $T_{burst}$ every cycle $T_{interval}$. | Temporal burst window calculation to stress test circuit breakers. |
 | **Probabilistic Injection** | Applies faults probabilistically ($0.0 \le p \le 1.0$) using cryptographically secure random generation. | Fine-grained percentage control (e.g. 10% 503s, 50% 200ms latency). |
 
 ### 4. Zero-Downtime Emergency Kill Switch
 - **Global & Atomic**: When activated, an $O(1)$ in-memory check instantly bypasses all active chaos rules across the entire proxy fleet.
+- **Lifecycle Protection**: While the kill switch is engaged, API endpoints strictly reject starting or transitioning experiments to `running` with `409 Conflict`.
 - **Fail-Open Architecture**: Internal proxy errors never disrupt critical traffic; requests default to transparent upstream passthrough.
 
 ### 5. Dual Storage Engine & Hot Cache
 - **Dual-Driver SQL**: Seamlessly supports **PostgreSQL** in production environments and zero-dependency embedded **SQLite** (via modern pure-Go `modernc.org/sqlite`) for local development.
+- **SQLite Referential Integrity & WAL**: Automatically configures `PRAGMA foreign_keys = ON;`, `PRAGMA journal_mode = WAL;`, and `PRAGMA busy_timeout = 5000;`.
+- **Dynamic Proxy Invalidation**: Upstream configuration changes immediately evict and refresh cached reverse proxy instances (`EvictProxy`).
+- **Lock-Free Hot Path**: When proxying incoming traffic, active experiments and upstream targets are read from an in-memory RCU-style cache, ensuring sub-microsecond rule evaluation.
 - **Lock-Free Hot Path**: When proxying incoming traffic, active experiments and upstream targets are read from an in-memory RCU-style cache, ensuring sub-microsecond rule evaluation.
 
 ---

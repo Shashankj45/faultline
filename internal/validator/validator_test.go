@@ -73,6 +73,34 @@ func TestCheckIPAllowed(t *testing.T) {
 			allowPrivate:   false,
 			wantErr:        nil,
 		},
+		{
+			name:           "Unspecified IPv4 is always blocked",
+			ip:             "0.0.0.0",
+			allowLocalhost: true,
+			allowPrivate:   true,
+			wantErr:        ErrUnspecifiedIPBlocked,
+		},
+		{
+			name:           "Unspecified IPv6 is always blocked",
+			ip:             "::",
+			allowLocalhost: true,
+			allowPrivate:   true,
+			wantErr:        ErrUnspecifiedIPBlocked,
+		},
+		{
+			name:           "Azure Wireserver Metadata is always blocked",
+			ip:             "168.63.129.16",
+			allowLocalhost: true,
+			allowPrivate:   true,
+			wantErr:        ErrMetadataBlocked,
+		},
+		{
+			name:           "AWS IMDSv6 Metadata is always blocked",
+			ip:             "fd00:ec2::254",
+			allowLocalhost: true,
+			allowPrivate:   true,
+			wantErr:        ErrMetadataBlocked,
+		},
 	}
 
 	for _, tt := range tests {
@@ -135,5 +163,17 @@ func TestSafeDialerPreventsRebinding(t *testing.T) {
 	err = dialer.Control("tcp", "127.0.0.1:8080", nil)
 	if err == nil {
 		t.Fatal("expected dialer control to reject loopback address")
+	}
+
+	// Test control with AWS IMDSv6 address
+	err = dialer.Control("tcp", "[fd00:ec2::254]:80", nil)
+	if err == nil {
+		t.Fatal("expected dialer control to reject AWS IMDSv6 address")
+	}
+
+	// Test control fails closed when socket address contains an unresolved hostname instead of IP
+	err = dialer.Control("tcp", "unresolved.internal.domain:80", nil)
+	if err == nil {
+		t.Fatal("expected dialer control to fail closed on non-IP host")
 	}
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,6 +75,17 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.mux.ServeHTTP(w, req)
 }
 
+type contextKey string
+
+const actorContextKey contextKey = "faultline_actor"
+
+func (r *Router) getActor(req *http.Request) string {
+	if a, ok := req.Context().Value(actorContextKey).(string); ok && a != "" {
+		return a
+	}
+	return "anonymous"
+}
+
 // requireRole wraps a handler with RBAC enforcement.
 //
 // Bootstrap mode: if no API keys exist in the store, the system is in dev/bootstrap mode
@@ -82,8 +94,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // Bearer token or X-API-Key header with sufficient role.
 func (r *Router) requireRole(required models.Role, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
-		// Check bootstrap mode — if no keys exist, skip auth so user can create first key
-		if keys, err := r.store.ListAPIKeys(req.Context()); err == nil && len(keys) == 0 {
+		// Check bootstrap mode via O(1) in-memory atomic flag.
+		// If no active API keys exist, allow initial access so operator can bootstrap the first key.
+		if !r.store.HasAPIKeys() {
+			req = req.WithContext(context.WithValue(req.Context(), actorContextKey, "bootstrap"))
 			next(w, req)
 			return
 		}
@@ -99,6 +113,11 @@ func (r *Router) requireRole(required models.Role, next http.HandlerFunc) http.H
 			return
 		}
 
+		actorName := apiKey.Name
+		if actorName == "" {
+			actorName = apiKey.KeyPrefix
+		}
+		req = req.WithContext(context.WithValue(req.Context(), actorContextKey, actorName))
 		next(w, req)
 	}
 }
@@ -271,7 +290,7 @@ func (r *Router) handleCreateUpstream(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	r.auditLogger.Log(req.Context(), "admin", "CREATE_UPSTREAM", "upstream", u.ID, u, req.RemoteAddr)
+	r.auditLogger.Log(req.Context(), r.getActor(req), "CREATE_UPSTREAM", "upstream", u.ID, u, req.RemoteAddr)
 	jsonResponse(w, http.StatusCreated, u)
 }
 
@@ -306,7 +325,10 @@ func (r *Router) handleUpdateUpstream(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	r.auditLogger.Log(req.Context(), "admin", "UPDATE_UPSTREAM", "upstream", u.ID, u, req.RemoteAddr)
+	// Invalidate cached reverse proxy to apply new host/transport configs
+	r.proxyServer.EvictProxy(u.ID)
+
+	r.auditLogger.Log(req.Context(), r.getActor(req), "UPDATE_UPSTREAM", "upstream", u.ID, u, req.RemoteAddr)
 	jsonResponse(w, http.StatusOK, u)
 }
 
@@ -316,7 +338,11 @@ func (r *Router) handleDeleteUpstream(w http.ResponseWriter, req *http.Request) 
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	r.auditLogger.Log(req.Context(), "admin", "DELETE_UPSTREAM", "upstream", id, nil, req.RemoteAddr)
+
+	// Invalidate cached reverse proxy
+	r.proxyServer.EvictProxy(id)
+
+	r.auditLogger.Log(req.Context(), r.getActor(req), "DELETE_UPSTREAM", "upstream", id, nil, req.RemoteAddr)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -354,12 +380,20 @@ func (r *Router) handleCreateExperiment(w http.ResponseWriter, req *http.Request
 		exp.MaxDurationSeconds = 3600 // 1 hour safety TTL
 	}
 
+	// Emergency Kill Switch check: cannot start active experiment while global kill switch is engaged
+	if exp.Status == models.StatusRunning {
+		if r.store.CachedKillSwitch().GlobalActive {
+			jsonError(w, http.StatusConflict, "cannot launch active experiment while global emergency kill switch is engaged")
+			return
+		}
+	}
+
 	if err := r.store.CreateExperiment(req.Context(), &exp); err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	r.auditLogger.Log(req.Context(), "admin", "CREATE_EXPERIMENT", "experiment", exp.ID, exp, req.RemoteAddr)
+	r.auditLogger.Log(req.Context(), r.getActor(req), "CREATE_EXPERIMENT", "experiment", exp.ID, exp, req.RemoteAddr)
 	jsonResponse(w, http.StatusCreated, exp)
 }
 
@@ -382,12 +416,20 @@ func (r *Router) handleUpdateExperiment(w http.ResponseWriter, req *http.Request
 	}
 	exp.ID = id
 
+	// Emergency Kill Switch check
+	if exp.Status == models.StatusRunning {
+		if r.store.CachedKillSwitch().GlobalActive {
+			jsonError(w, http.StatusConflict, "cannot set experiment to running while global emergency kill switch is engaged")
+			return
+		}
+	}
+
 	if err := r.store.UpdateExperiment(req.Context(), &exp); err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	r.auditLogger.Log(req.Context(), "admin", "UPDATE_EXPERIMENT", "experiment", exp.ID, exp, req.RemoteAddr)
+	r.auditLogger.Log(req.Context(), r.getActor(req), "UPDATE_EXPERIMENT", "experiment", exp.ID, exp, req.RemoteAddr)
 	jsonResponse(w, http.StatusOK, exp)
 }
 
@@ -401,12 +443,20 @@ func (r *Router) handleUpdateExperimentStatus(w http.ResponseWriter, req *http.R
 		return
 	}
 
+	// Emergency Kill Switch check: block activation while engaged
+	if body.Status == models.StatusRunning {
+		if r.store.CachedKillSwitch().GlobalActive {
+			jsonError(w, http.StatusConflict, "cannot activate experiment while global emergency kill switch is engaged")
+			return
+		}
+	}
+
 	if err := r.store.UpdateExperimentStatus(req.Context(), id, body.Status); err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	r.auditLogger.Log(req.Context(), "admin", "CHANGE_EXPERIMENT_STATUS", "experiment", id, body, req.RemoteAddr)
+	r.auditLogger.Log(req.Context(), r.getActor(req), "CHANGE_EXPERIMENT_STATUS", "experiment", id, body, req.RemoteAddr)
 	jsonResponse(w, http.StatusOK, map[string]string{"id": id, "status": string(body.Status)})
 }
 
@@ -416,7 +466,7 @@ func (r *Router) handleDeleteExperiment(w http.ResponseWriter, req *http.Request
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	r.auditLogger.Log(req.Context(), "admin", "DELETE_EXPERIMENT", "experiment", id, nil, req.RemoteAddr)
+	r.auditLogger.Log(req.Context(), r.getActor(req), "DELETE_EXPERIMENT", "experiment", id, nil, req.RemoteAddr)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -453,7 +503,7 @@ func (r *Router) handleCreateRule(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	r.auditLogger.Log(req.Context(), "admin", "CREATE_RULE", "fault_rule", rule.ID, rule, req.RemoteAddr)
+	r.auditLogger.Log(req.Context(), r.getActor(req), "CREATE_RULE", "fault_rule", rule.ID, rule, req.RemoteAddr)
 	jsonResponse(w, http.StatusCreated, rule)
 }
 
@@ -471,7 +521,7 @@ func (r *Router) handleUpdateRule(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	r.auditLogger.Log(req.Context(), "admin", "UPDATE_RULE", "fault_rule", rule.ID, rule, req.RemoteAddr)
+	r.auditLogger.Log(req.Context(), r.getActor(req), "UPDATE_RULE", "fault_rule", rule.ID, rule, req.RemoteAddr)
 	jsonResponse(w, http.StatusOK, rule)
 }
 
@@ -481,7 +531,7 @@ func (r *Router) handleDeleteRule(w http.ResponseWriter, req *http.Request) {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	r.auditLogger.Log(req.Context(), "admin", "DELETE_RULE", "fault_rule", id, nil, req.RemoteAddr)
+	r.auditLogger.Log(req.Context(), r.getActor(req), "DELETE_RULE", "fault_rule", id, nil, req.RemoteAddr)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -536,7 +586,7 @@ func (r *Router) handleCreateAPIKey(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	r.auditLogger.Log(req.Context(), "admin", "CREATE_API_KEY", "api_key", keyModel.ID, keyModel, req.RemoteAddr)
+	r.auditLogger.Log(req.Context(), r.getActor(req), "CREATE_API_KEY", "api_key", keyModel.ID, keyModel, req.RemoteAddr)
 
 	jsonResponse(w, http.StatusCreated, map[string]any{
 		"api_key":   keyModel,
@@ -550,7 +600,7 @@ func (r *Router) handleRevokeAPIKey(w http.ResponseWriter, req *http.Request) {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	r.auditLogger.Log(req.Context(), "admin", "REVOKE_API_KEY", "api_key", id, nil, req.RemoteAddr)
+	r.auditLogger.Log(req.Context(), r.getActor(req), "REVOKE_API_KEY", "api_key", id, nil, req.RemoteAddr)
 	w.WriteHeader(http.StatusNoContent)
 }
 
