@@ -50,7 +50,9 @@ func NewSQLStore(driverName, dataSourceName string) (*SQLStore, error) {
 
 	// Connection pool tuning and engine pragma configuration
 	if driverName == "sqlite" {
-		db.SetMaxOpenConns(1) // SQLite single-writer safety
+		db.SetMaxOpenConns(10) // Allow concurrent readers in WAL mode
+		db.SetMaxIdleConns(5)
+		db.SetConnMaxLifetime(10 * time.Minute)
 		// Enforce referential integrity (cascades), concurrency WAL journal, and busy timeout
 		if _, err := db.Exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;"); err != nil {
 			return nil, fmt.Errorf("failed to configure sqlite pragmas: %w", err)
