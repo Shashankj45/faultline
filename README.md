@@ -5,6 +5,11 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?style=flat&logo=typescript)](https://www.typescriptlang.org)
 [![Prometheus](https://img.shields.io/badge/Prometheus-Metrics-E6522C?style=flat&logo=prometheus)](https://prometheus.io)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Live Demo](https://img.shields.io/badge/Render-Live%20Demo-46E3B7?style=flat&logo=render)](https://faultline-chaos-proxy.onrender.com)
+
+> 🚀 **Live Cloud Console:** [https://faultline-chaos-proxy.onrender.com](https://faultline-chaos-proxy.onrender.com)  
+> 📊 **Live Prometheus Metrics:** [https://faultline-chaos-proxy.onrender.com/metrics](https://faultline-chaos-proxy.onrender.com/metrics)  
+> 🩺 **Live System Health:** [https://faultline-chaos-proxy.onrender.com/api/v1/health](https://faultline-chaos-proxy.onrender.com/api/v1/health)
 
 **FaultLine** is an industrial-grade, programmable HTTP reverse proxy designed for reliability and systems engineers to systematically simulate adverse network conditions, service degradations, and cascading failures against microservices.
 
@@ -108,7 +113,35 @@ flowchart TD
 
 ---
 
-## Getting Started
+## Live Cloud Deployment & Quick Demo
+
+The proxy is deployed live on Render with built-in mock services (`orders`, `payments`, `inventory`):
+
+| Resource | Live Cloud URL |
+| :--- | :--- |
+| **Interactive Web Console** | [https://faultline-chaos-proxy.onrender.com](https://faultline-chaos-proxy.onrender.com) |
+| **Health Check Endpoint** | [https://faultline-chaos-proxy.onrender.com/api/v1/health](https://faultline-chaos-proxy.onrender.com/api/v1/health) |
+| **Prometheus Metrics Stream** | [https://faultline-chaos-proxy.onrender.com/metrics](https://faultline-chaos-proxy.onrender.com/metrics) |
+| **Live Upstreams Directory** | [https://faultline-chaos-proxy.onrender.com/api/v1/upstreams](https://faultline-chaos-proxy.onrender.com/api/v1/upstreams) |
+| **Sample Reverse Proxy Ingress** | [https://faultline-chaos-proxy.onrender.com/proxy/orders/v1/orders](https://faultline-chaos-proxy.onrender.com/proxy/orders/v1/orders) |
+
+### Quick Test via CLI
+Test the live deployed cloud proxy directly without installing anything locally:
+
+```bash
+# 1. Probe system health
+curl -s https://faultline-chaos-proxy.onrender.com/api/v1/health
+
+# 2. Test reverse proxy routing to upstream orders service
+curl -s https://faultline-chaos-proxy.onrender.com/proxy/orders/v1/orders
+
+# 3. View live Prometheus scrape metrics
+curl -s https://faultline-chaos-proxy.onrender.com/metrics | grep faultline_http
+```
+
+---
+
+## Getting Started (Local Development)
 
 ### Prerequisites
 - Go 1.23+
@@ -119,7 +152,7 @@ FaultLine includes embedded mock services (`orders`, `payments`, `inventory`) an
 
 ```bash
 # Clone the repository
-git clone https://github.com/faultline-proxy/faultline.git
+git clone https://github.com/Shashankj45/faultline.git
 cd FaultLine
 
 # Build the Go binary (includes built React console)
