@@ -5,6 +5,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?style=flat&logo=typescript)](https://www.typescriptlang.org)
 [![Prometheus](https://img.shields.io/badge/Prometheus-Metrics-E6522C?style=flat&logo=prometheus)](https://prometheus.io)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![CI](https://github.com/Shashankj45/faultline/actions/workflows/ci.yml/badge.svg)](https://github.com/Shashankj45/faultline/actions/workflows/ci.yml)
 [![Live Demo](https://img.shields.io/badge/Render-Live%20Demo-46E3B7?style=flat&logo=render)](https://faultline-chaos-proxy.onrender.com)
 
 > 🚀 **Live Cloud Console:** [https://faultline-chaos-proxy.onrender.com](https://faultline-chaos-proxy.onrender.com)  
