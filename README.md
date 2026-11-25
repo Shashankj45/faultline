@@ -22,43 +22,71 @@ Sitting transparently between client applications and upstream backends, FaultLi
 
 ```mermaid
 flowchart TD
-    Client["Client Microservice / Browser"] -->|HTTP / REST| Proxy["FaultLine Ingress Router (/proxy/{slug}/*)"]
+    Client["Client Microservice / Caller"]
+    Operator["Admin / DevOps Engineer"]
 
-    subgraph Pipeline["Interception & Fault Engine Pipeline"]
-        Proxy --> Inspector["Request Inspector & Context Tracing"]
-        Inspector --> Auth["Authentication & RBAC (Bearer / API Keys)"]
-        Auth --> KillSwitch{"Emergency Kill Switch Active?"}
+    subgraph DataPlane["Data Plane: Traffic Interception & Chaos Pipeline (/proxy/:slug/*)"]
+        Ingress["Proxy Ingress & Safety Guards<br/>(Loop Detection, 32MB Payload Cap)"]
+        Resolver["Upstream Resolver<br/>(Matches Slug to Target Upstream)"]
+        KillSwitch{"Emergency Kill Switch<br/>Active?"}
+        RuleMatcher["Fault Rule Matcher<br/>(Method, Path, Headers, CIDR, Probability)"]
         
-        KillSwitch -->|YES (Passthrough)| Forwarder["Upstream Destination Validator & Safe Dialer"]
-        KillSwitch -->|NO (Evaluate)| RuleMatcher["Fault Rule Matcher (Method, Path, Headers, CIDR, Probability)"]
+        PreFault{"Matched Fault<br/>Action?"}
+        LatencyEngine["Latency Engine<br/>(Jitter, Gaussian, Ramp Delay)"]
+        ErrorInjector["HTTP Error Injector<br/>(5xx, 429, Custom JSON)"]
+        Hijacker["TCP Hijacker<br/>(SO_LINGER=0 RST, Empty EOF)"]
+        TimeoutEngine["Timeout / Stall Engine<br/>(Slowloris, 504 Gateway Timeout)"]
+        
+        Forwarder["Safe Forwarding Engine<br/>(httputil.ReverseProxy + sync.Pool)"]
+        SafeDialer["SafeDialer Transport Hooks<br/>(Blocks SSRF, DNS Rebinding, 169.254.169.254)"]
+        Upstream["Authorized Upstream Service"]
+        
+        PostFault["Post-Upstream Handling & Throttler<br/>(Token Bucket Rate Limiting)"]
+        Telemetry["Telemetry & Response Handler<br/>(OTel Spans, Prometheus Metrics)"]
 
-        RuleMatcher --> PreFault{"Pre-Upstream Fault?"}
-        PreFault -->|Latency| LatencyEngine["Latency Engine (Jitter, Gaussian, Ramp)"]
-        PreFault -->|HTTP Error| ErrorInjector["HTTP Error Injector (5xx, 429, Custom Schema)"]
-        PreFault -->|Abort/RST| Hijacker["TCP Hijacker (SO_LINGER=0 RST, Empty EOF, Truncation)"]
-        PreFault -->|Timeout| TimeoutEngine["Timeout Engine (Slowloris, Client Stall, 504)"]
+        Client -->|HTTP / REST| Ingress
+        Ingress --> Resolver
+        Resolver --> KillSwitch
 
+        KillSwitch -->|YES: Transparent Passthrough| Forwarder
+        KillSwitch -->|NO: Evaluate Chaos| RuleMatcher
+
+        RuleMatcher --> PreFault
+        PreFault -->|No Fault / Pass| Forwarder
+        PreFault -->|Latency Delay| LatencyEngine
         LatencyEngine --> Forwarder
-        Forwarder --> SSRF["SSRF & DNS Rebinding Validator (SafeDialer Control)"]
-        SSRF --> Transport["Custom Transport Pool (sync.Pool Buffer Copy)"]
+        PreFault -->|Immediate Error| ErrorInjector
+        PreFault -->|Connection Drop| Hijacker
+        PreFault -->|Hold / Timeout| TimeoutEngine
 
-        Transport --> Upstream["Authorized Upstream Service"]
+        Forwarder --> SafeDialer
+        SafeDialer -->|Protected Dial| Upstream
+        Upstream --> PostFault
+        PostFault --> Telemetry
 
-        Upstream --> PostFault{"Post-Upstream Fault?"}
-        PostFault -->|Bandwidth Limit| Throttler["Bandwidth Throttler (Token Bucket Rate Limiter)"]
-        PostFault -->|Passthrough| RespHandler["Response Handler & Telemetry Injector"]
-        Throttler --> RespHandler
-        ErrorInjector --> RespHandler
+        ErrorInjector -->|Error Response| Client
+        Hijacker -.->|Raw TCP RST / EOF| Client
+        TimeoutEngine -->|504 Timeout| Client
+        Telemetry -->|Upstream Response| Client
     end
 
-    RespHandler --> Client
+    subgraph ControlPlane["Control Plane & Observability (/api/v1/*, /metrics)"]
+        WebUI["React 18 Admin Dashboard<br/>(Embedded via embed.FS)"]
+        AdminAPI["Admin REST API<br/>(/api/v1/*)"]
+        AuthMiddleware["Auth & RBAC Middleware<br/>(SHA-256 API Keys)"]
+        Store[("Dual Storage Engine<br/>(PostgreSQL / SQLite WAL)")]
+        Prometheus["Prometheus Exporter<br/>(/metrics)"]
+        AuditLedger["Tamper-Evident Audit Ledger"]
 
-    subgraph ControlPlane["Control Plane & Observability"]
-        Store["Storage Engine (PostgreSQL / SQLite Dual Driver)"]
-        HealthChecker["Active/Passive Upstream Health Monitor"]
-        Prometheus["Prometheus Metrics (/metrics)"]
-        AuditLog["Tamper-Evident Audit Ledger"]
-        WebConsole["React 18 + TypeScript Admin Console (Web UI)"]
+        Operator -->|Browser / HTTPS| WebUI
+        Operator -->|CLI / API Requests| AdminAPI
+        WebUI --> AdminAPI
+        AdminAPI --> AuthMiddleware
+        AuthMiddleware --> Store
+        AuthMiddleware --> AuditLedger
+        AuthMiddleware -->|Toggle State| KillSwitch
+        AuthMiddleware -->|Sync Rules| RuleMatcher
+        Telemetry -.->|Expose Counts/Latency| Prometheus
     end
 ```
 
@@ -109,7 +137,6 @@ flowchart TD
 - **Dual-Driver SQL**: Seamlessly supports **PostgreSQL** in production environments and zero-dependency embedded **SQLite** (via modern pure-Go `modernc.org/sqlite`) for local development.
 - **SQLite Referential Integrity & WAL**: Automatically configures `PRAGMA foreign_keys = ON;`, `PRAGMA journal_mode = WAL;`, and `PRAGMA busy_timeout = 5000;`.
 - **Dynamic Proxy Invalidation**: Upstream configuration changes immediately evict and refresh cached reverse proxy instances (`EvictProxy`).
-- **Lock-Free Hot Path**: When proxying incoming traffic, active experiments and upstream targets are read from an in-memory RCU-style cache, ensuring sub-microsecond rule evaluation.
 - **Lock-Free Hot Path**: When proxying incoming traffic, active experiments and upstream targets are read from an in-memory RCU-style cache, ensuring sub-microsecond rule evaluation.
 
 ---
